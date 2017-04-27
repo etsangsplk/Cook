@@ -176,7 +176,10 @@
    (s/optional-key :output_url) s/Str
    (s/optional-key :cancelled) s/Bool
    (s/optional-key :reason_string) s/Str
-   (s/optional-key :progress) s/Int})
+   (s/optional-key :exit_code) s/Int
+   (s/optional-key :progress) s/Int
+   (s/optional-key :progress_message) s/Str
+   (s/optional-key :sandbox) s/Str})
 
 (defn max-128-characters-and-alphanum?
   "Returns true if s contains only '.', '_', '-' or
@@ -742,28 +745,31 @@
   "Takes the executor-id->sandbox-directory from the agent json and constructs a URL to query it. Hardcodes fun
    stuff like the port we run the agent on. Users will need to add the file path & offset to their query. Refer to
    the 'Using the output_url' section in docs/scheduler-rest-api.asc for further details."
-  [fid agent-hostname executor-id]
+  [framework-id agent-hostname executor-id sandbox-location]
   (try
-    (let [executor-id->sandbox-directory (get-executor-id->sandbox-directory fid agent-hostname)
-          directory (executor-id->sandbox-directory executor-id)]
+    (when-let [directory (or sandbox-location
+                             ((get-executor-id->sandbox-directory framework-id agent-hostname) executor-id))]
       (str "http://" agent-hostname ":5051" "/files/read.json?path="
            (URLEncoder/encode directory "UTF-8")))
     (catch Exception e
       (log/error e "Unable to retrieve directory path for" executor-id "on agent" agent-hostname)
       nil)))
 
-(defn- instance->instance-map
-  "Converts the instance to a map of relevant fields that will be returned to the caller"
-  [db fid instance]
+(defn fetch-instance-map
+  "Converts the instance entity to a map representing the instance fields."
+  [db framework-id instance]
   (let [hostname (:instance/hostname instance)
         executor-id (:instance/executor-id instance)
-        url-path (retrieve-url-path fid hostname executor-id)
+        sandbox (:instance/sandbox instance)
+        url-path (retrieve-url-path framework-id hostname executor-id sandbox)
         start (:instance/start-time instance)
         mesos-start (:instance/mesos-start-time instance)
         end (:instance/end-time instance)
         cancelled (:instance/cancelled instance)
         reason (reason/instance-entity->reason-entity db instance)
-        progress (:instance/progress instance)]
+        exit-code (:instance/exit-code instance)
+        progress (:instance/progress instance)
+        progress-message (:instance/progress-message instance)]
     (cond-> {:backfilled false ;; Backfill has been deprecated
              :executor_id executor-id
              :hostname hostname
@@ -772,14 +778,17 @@
              :slave_id (:instance/slave-id instance)
              :status (name (:instance/status instance))
              :task_id (:instance/task-id instance)}
-            url-path (assoc :output_url url-path)
             start (assoc :start_time (.getTime start))
             mesos-start (assoc :mesos_start_time (.getTime mesos-start))
             end (assoc :end_time (.getTime end))
             cancelled (assoc :cancelled cancelled)
+            exit-code (assoc :exit_code exit-code)
+            url-path (assoc :output_url url-path)
             reason (assoc :reason_code (:reason/code reason)
                           :reason_string (:reason/string reason))
-            progress (assoc :progress progress))))
+            progress (assoc :progress progress)
+            progress-message (assoc :progress_message progress-message)
+            sandbox (assoc :sandbox sandbox))))
 
 (defn fetch-job-map
   [db fid job-uuid]
@@ -801,11 +810,11 @@
                          (map (fn [{:keys [attribute operator pattern]}]
                                 (->> [attribute (str/upper-case (name operator)) pattern]
                                      (map str)))))
-        instances (map #(instance->instance-map db fid %) (:job/instance job))
+        instances (map #(fetch-instance-map db fid %1) (:job/instance job))
         submit-time (when (:job/submit-time job) ; due to a bug, submit time may not exist for some jobs
                 (.getTime (:job/submit-time job)))
         job-map {:command (:job/command job)
-                 :constraints constraints 
+                 :constraints constraints
                  :cpus (:cpus resources)
                  :disable_mea_culpa_retries (:job/disable-mea-culpa-retries job false)
                  :env (util/job-ent->env job)

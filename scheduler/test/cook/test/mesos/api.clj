@@ -1162,7 +1162,7 @@
     (is (cheshire/generate-string (api/stringify settings)))))
 
 (deftest unscheduled-api
-  (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
+  (let [conn (restore-fresh-database! "datomic:mem://unscheduled-api-test")
         h (basic-handler conn)
         uuid (java.util.UUID/randomUUID)
         create-response (h {:request-method :post
@@ -1214,14 +1214,18 @@
           (is (= expected-result actual-result))))
 
       (testing "retrieve-url-path"
-        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-100")))
+        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-100" nil)))
+        (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fsandbox%2Flocation")
+               (api/retrieve-url-path target-framework-id agent-hostname "executor-100" "/sandbox/location")))
         (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-101")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-101")))
+               (api/retrieve-url-path target-framework-id agent-hostname "executor-101" nil)))
+        (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fsandbox%2Flocation")
+               (api/retrieve-url-path target-framework-id agent-hostname "executor-101" "/sandbox/location")))
         (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-102")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-102")))
-        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-103")))
+               (api/retrieve-url-path target-framework-id agent-hostname "executor-102" nil)))
+        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-103" nil)))
         (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-111")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-111")))))))
+               (api/retrieve-url-path target-framework-id agent-hostname "executor-111" nil)))))))
 
 (deftest test-instance-progress
   (let [uri "datomic:mem://test-instance-progress"
@@ -1261,3 +1265,81 @@
     (send-status-update 100)
     (is (= 100 (progress-from-db)))
     (is (= 100 (progress-from-api)))))
+
+(deftest test-fetch-instance-map
+  (let [conn (restore-fresh-database! "datomic:mem://test-fetch-instance-map")
+        framework-id "framework-id-1"]
+    (let [job-entity-id (create-dummy-job conn :user "test-user"
+                                          :job-state :job.state/completed)
+          basic-instance-properties {:executor-id (str job-entity-id "-executor-1")
+                                     :slave-id "slave-1"
+                                     :task-id (str job-entity-id "-task-1")}
+          basic-instance-map {:executor_id (str job-entity-id "-executor-1")
+                              :slave_id "slave-1"
+                              :task_id (str job-entity-id "-task-1")}]
+
+      (with-redefs [api/get-executor-id->sandbox-directory
+                    (fn [framework-id agent-hostname]
+                      {(:executor-id basic-instance-properties)
+                       (str "/" framework-id "/" agent-hostname "/path")})]
+        (testing "basic-instance-without-sandbox"
+          (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
+                                          :instance-status :instance.status/success
+                                          (mapcat seq basic-instance-properties))
+                instance-entity (d/entity (db conn) instance-entity-id)
+                instance-map (api/fetch-instance-map (db conn) framework-id instance-entity)
+                expected-map (assoc basic-instance-map
+                               :backfilled false
+                               :hostname "localhost"
+                               :output_url "http://localhost:5051/files/read.json?path=%2Fframework-id-1%2Flocalhost%2Fpath"
+                               :ports nil
+                               :preempted false
+                               :progress 0
+                               :status "success")]
+            (is (= expected-map (dissoc instance-map :start_time)))))
+
+        (testing "basic-instance-with-sandbox-url"
+          (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
+                                          :instance-status :instance.status/success
+                                          :sandbox "/path/to/working/directory"
+                                          (mapcat seq basic-instance-properties))
+                instance-entity (d/entity (db conn) instance-entity-id)
+                instance-map (api/fetch-instance-map (db conn) framework-id instance-entity)
+                expected-map (assoc basic-instance-map
+                               :backfilled false
+                               :hostname "localhost"
+                               :output_url "http://localhost:5051/files/read.json?path=%2Fpath%2Fto%2Fworking%2Fdirectory"
+                               :ports nil
+                               :preempted false
+                               :progress 0
+                               :sandbox "/path/to/working/directory"
+                               :status "success")]
+            (is (= expected-map (dissoc instance-map :start_time)))))
+
+        (testing "detailed-instance"
+          (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
+                                          :exit-code 2
+                                          :hostname "agent-hostname"
+                                          :instance-status :instance.status/success
+                                          :preempted? true
+                                          :progress 78
+                                          :progress-message "seventy-eight percent done"
+                                          :reason :preempted-by-rebalancer
+                                          :sandbox "/path/to/working/directory"
+                                          (mapcat seq basic-instance-properties))
+                instance-entity (d/entity (db conn) instance-entity-id)
+                instance-map (api/fetch-instance-map (db conn) framework-id instance-entity)
+                expected-map (assoc basic-instance-map
+                               :backfilled false
+                               :exit_code 2
+                               :hostname "agent-hostname"
+                               :output_url "http://agent-hostname:5051/files/read.json?path=%2Fpath%2Fto%2Fworking%2Fdirectory"
+                               :ports nil
+                               :preempted true
+                               :progress 78
+                               :progress_message "seventy-eight percent done"
+                               :reason_code 1002
+                               :reason_string "Preempted by rebalancer"
+                               :sandbox "/path/to/working/directory"
+                               :status "success")]
+            (is (= expected-map (dissoc instance-map :start_time)))))))))
