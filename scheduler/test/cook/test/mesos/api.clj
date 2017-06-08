@@ -19,6 +19,7 @@
             [clj-http.client :as http]
             [clj-time.core :as t]
             [clojure.core.async :as async]
+            [clojure.core.cache :as cache]
             [clojure.data.json :as json]
             [clojure.walk :refer (keywordize-keys)]
             [cook.authorization :as auth]
@@ -36,10 +37,8 @@
            java.io.ByteArrayOutputStream
            java.net.ServerSocket
            java.util.UUID
-           (javax.servlet ServletOutputStream
-                          ServletResponse)
-           org.apache.curator.test.TestingServer
-           org.joda.time.Minutes))
+           (javax.servlet ServletOutputStream ServletResponse)
+           org.apache.curator.test.TestingServer))
 
 (defn kw-keys
   [m]
@@ -78,9 +77,10 @@
 (defn basic-handler
   [conn & {:keys [cpus memory-gb gpus-enabled retry-limit] :or {cpus 12 memory-gb 100 gpus-enabled false retry-limit 200}}]
   (main-handler conn "my-framework-id" (fn [] [])
-                {:task-constraints {:cpus cpus :memory-gb memory-gb :retry-limit retry-limit}
+                {:is-authorized-fn authorized-fn
+                 :retrieve-url-path-fn (fn [fid hostname executor-id] (str "http://" hostname "/" fid "/" executor-id))
                  :mesos-gpu-enabled gpus-enabled
-                 :is-authorized-fn authorized-fn}))
+                 :task-constraints {:cpus cpus :memory-gb memory-gb :retry-limit retry-limit}}))
 
 (defn response->body-data [{:keys [body]}]
   (let [baos (ByteArrayOutputStream.)
@@ -1031,7 +1031,8 @@
         (is (thrown? Exception (s/validate api/Job (assoc min-job :expected-runtime 3 :max-runtime 2))))))))
 
 (deftest test-create-jobs!
-  (let [expected-job-map
+  (let [retrieve-url-path (fn [fid hostname executor-id] (str "http://" hostname "/" fid "/" executor-id))
+        expected-job-map
         (fn
           ; Converts the provided job and framework-id (fid) to the job-map we expect to get back from
           ; api/fetch-job-map. Note that we don't include the submit_time field here, so assertions below
@@ -1087,7 +1088,7 @@
                                       {:resource/type :resource.type/mem
                                        :resource/amount (:mem job)}]}
               _ @(d/transact conn [job-ent])
-              job-resp (api/fetch-job-map (db conn) fid uuid)]
+              job-resp (api/fetch-job-map (db conn) fid retrieve-url-path uuid)]
           (is (= (expected-job-map job fid)
                  (dissoc job-resp :submit_time)))
           (s/validate api/JobResponse
@@ -1101,7 +1102,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job fid)
-                 (dissoc (api/fetch-job-map (db conn) fid uuid) :submit_time)))))
+                 (dissoc (api/fetch-job-map (db conn) fid retrieve-url-path uuid) :submit_time)))))
 
       (testing "should work when the job specifies an application"
         (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -1111,7 +1112,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job fid)
-                 (dissoc (api/fetch-job-map (db conn) fid uuid) :submit_time)))))
+                 (dissoc (api/fetch-job-map (db conn) fid retrieve-url-path uuid) :submit_time)))))
 
       (testing "should work when the job specifies the expected runtime"
         (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -1120,7 +1121,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job fid)
-                 (dissoc (api/fetch-job-map (db conn) fid uuid) :submit_time)))))
+                 (dissoc (api/fetch-job-map (db conn) fid retrieve-url-path uuid) :submit_time)))))
 
       (testing "should work when the job specifies disable-mea-culpa-retries"
         (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -1129,7 +1130,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job fid)
-                 (dissoc (api/fetch-job-map (db conn) fid uuid) :submit_time))))))))
+                 (dissoc (api/fetch-job-map (db conn) fid retrieve-url-path uuid) :submit_time))))))))
 
 (defn- minimal-config
   "Returns a minimal configuration map"
@@ -1213,15 +1214,28 @@
                                "executor-111" "/path/for/executor-111"}]
           (is (= expected-result actual-result))))
 
-      (testing "retrieve-url-path"
-        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-100")))
-        (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-101")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-101")))
-        (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-102")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-102")))
-        (is (nil? (api/retrieve-url-path target-framework-id agent-hostname "executor-103")))
-        (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-111")
-               (api/retrieve-url-path target-framework-id agent-hostname "executor-111")))))))
+      (let [cache (-> {} (cache/basic-cache-factory) atom)]
+        (letfn [(get-executor-id->sandbox-directory [framework-id agent-hostname]
+                  (api/get-executor-id->sandbox-directory framework-id agent-hostname cache))
+                (retrieve-url-path [fid agent-hostname executor-id]
+                  (api/retrieve-url-path fid agent-hostname executor-id get-executor-id->sandbox-directory))]
+
+          (testing "retrieve-url-path"
+            (is (nil? (retrieve-url-path target-framework-id agent-hostname "executor-100")))
+            (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-101")
+                   (retrieve-url-path target-framework-id agent-hostname "executor-101")))
+            (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-102")
+                   (retrieve-url-path target-framework-id agent-hostname "executor-102")))
+            (is (nil? (retrieve-url-path target-framework-id agent-hostname "executor-103")))
+            (is (= (str "http://" agent-hostname ":5051/files/read.json?path=%2Fpath%2Ffor%2Fexecutor-111")
+                   (retrieve-url-path target-framework-id agent-hostname "executor-111"))))
+
+          (testing "get-executor-id->sandbox-directory cached value"
+            (let [actual-result @(cache/lookup @cache agent-hostname)
+                  expected-result {"executor-101" "/path/for/executor-101"
+                                   "executor-102" "/path/for/executor-102"
+                                   "executor-111" "/path/for/executor-111"}]
+              (is (= expected-result actual-result)))))))))
 
 (deftest test-instance-progress
   (let [uri "datomic:mem://test-instance-progress"
@@ -1248,7 +1262,8 @@
                                        [?i :instance/progress ?p]]
                                      (db conn) instance-id))
         job-uuid (:job/uuid (d/entity (db conn) job-id))
-        progress-from-api #(:progress (first (:instances (api/fetch-job-map (db conn) nil job-uuid))))]
+        retrieve-url-path-fn (fn [framework-id hostname executor-id] (str "http://" hostname "/" framework-id "/" executor-id))
+        progress-from-api #(:progress (first (:instances (api/fetch-job-map (db conn) nil retrieve-url-path-fn job-uuid))))]
     (send-status-update 0)
     (is (= 0 (progress-from-db)))
     (is (= 0 (progress-from-api)))

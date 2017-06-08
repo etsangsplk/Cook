@@ -14,7 +14,6 @@
 ;;
 (ns cook.components
   (:require [clj-logging-config.log4j :as log4j-conf]
-            [clj-pid.core :as pid]
             [clj-time.core :as t]
             [clojure.core.cache :as cache]
             [clojure.edn :as edn]
@@ -27,7 +26,6 @@
             [congestion.middleware :refer (wrap-rate-limit ip-rate-limit)]
             [congestion.storage :as storage]
             [cook.curator :as curator]
-            [cook.spnego :as spnego]
             [metrics.ring.instrument :refer (instrument)]
             [plumbing.core :refer (fnk)]
             [plumbing.graph :as graph]
@@ -436,7 +434,20 @@
                      (when enabled?
                        (when (zero? port)
                          (throw (ex-info "You enabled nrepl but didn't configure a port. Please configure a port in your config file." {})))
-                       ((lazy-load-var 'clojure.tools.nrepl.server/start-server) :port port)))}))
+                       ((lazy-load-var 'clojure.tools.nrepl.server/start-server) :port port)))
+     :retrieve-url-path-fn (fnk [[:config {agent-query-cache {:threshold 1000, :ttl 6000}}]]
+                             (let [{:keys [threshold ttl]} agent-query-cache
+                                   _ (log/info "Agent query cache will be created using:" {:threshold threshold, :ttl ttl})
+                                   cache (-> {}
+                                             (cache/fifo-cache-factory :threshold threshold)
+                                             (cache/ttl-cache-factory :ttl ttl)
+                                             atom)]
+                               (letfn [(executor-id->sandbox-directory-fn [framework-id agent-hostname]
+                                         ((lazy-load-var 'cook.mesos.api/get-executor-id->sandbox-directory)
+                                           framework-id agent-hostname cache))]
+                                 (fn retrieve-url-path-fn [framework-id agent-hostname executor-id]
+                                   ((lazy-load-var 'cook.mesos.api/retrieve-url-path)
+                                     framework-id agent-hostname executor-id executor-id->sandbox-directory-fn)))))}))
 
 (defn init-logger
   ([] (init-logger {:levels {"datomic.db" :warn
