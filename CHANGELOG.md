@@ -3,7 +3,10 @@
 All notable changes to this project will be documented in this file
  
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
- 
+
+## [Unreleased]
+### Added
+- Added configuration for agent-query-cache, from @shamsimam
 ## [1.4.0] - 2017-06-09
 ### Added
 - Added simulator to test scheduler performance, from @wyegelwel
@@ -11,7 +14,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Added instance progress to query response, from @dposada
 ### Changed
 - Fixed bug where job submit errors would return 201, from @pschorf
-- Optimizations in ranking to improve schedule time, from @shams
+- Optimizations in ranking to improve schedule time, from @shamsimam
 - Refactor fenzo constraints to use less memory, from @pschorf
 ## [1.3.2] - 2017-05-24
 ### Added
