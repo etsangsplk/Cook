@@ -50,7 +50,6 @@
                              VMTaskFitnessCalculator VirtualMachineLease VirtualMachineLease$Range
                              VirtualMachineCurrentState]
           [com.netflix.fenzo.functions Action1 Func1]
-          java.util.Date
           java.util.concurrent.TimeUnit))
 
 (defn now
@@ -617,7 +616,7 @@
 
 (defn- launch-matched-tasks!
   "Updates the state of matched tasks in the database and then launches them."
-  [matches conn db driver fenzo fid]
+  [matches conn db driver fenzo framework-id]
   (let [task-txns (matches->task-txns matches)]
     ;; Note that this transaction can fail if a job was scheduled
     ;; during a race. If that happens, then other jobs that should
@@ -644,7 +643,7 @@
       handle-resource-offer!-mesos-submit-duration
       (doseq [{:keys [tasks leases]} matches
               :let [offers (mapv :offer leases)
-                    task-data-maps (map #(task/TaskAssignmentResult->task-metadata db fid %) tasks)
+                    task-data-maps (map #(task/TaskAssignmentResult->task-metadata db framework-id %) tasks)
                     task-infos (task/compile-mesos-messages offers task-data-maps)]]
         (log/debug "Matched task-infos" task-infos)
         (mesos/launch-tasks! driver (mapv :id offers) task-infos)
@@ -657,7 +656,7 @@
 (defn handle-resource-offers!
   "Gets a list of offers from mesos. Decides what to do with them all--they should all
    be accepted or rejected at the end of the function."
-  [conn driver ^TaskScheduler fenzo fid category->pending-jobs-atom offer-cache user->usage user->quota num-considerable offers-chan offers]
+  [conn driver ^TaskScheduler fenzo framework-id category->pending-jobs-atom offer-cache user->usage user->quota num-considerable offers-chan offers]
   (log/debug "invoked handle-resource-offers!")
   (let [offer-stash (atom nil)] ;; This is a way to ensure we never lose offers fenzo assigned if an error occurs in the middle of processing
     ;; TODO: It is possible to have an offer expire by mesos because we recycle it a bunch of times.
@@ -701,7 +700,7 @@
             (do
               (swap! category->pending-jobs-atom remove-matched-jobs-from-pending-jobs category->job-uuids)
               (log/debug "updated category->pending-jobs:" @category->pending-jobs-atom)
-              (launch-matched-tasks! matches conn db driver fenzo fid)
+              (launch-matched-tasks! matches conn db driver fenzo framework-id)
               matched-normal-considerable-jobs-head?)))
         (catch Throwable t
           (meters/mark! handle-resource-offer!-errors)
@@ -730,7 +729,7 @@
 (counters/defcounter [cook-mesos scheduler offer-chan-depth])
 
 (defn make-offer-handler
-  [conn driver-atom fenzo fid-atom pending-jobs-atom offer-cache
+  [conn driver-atom fenzo framework-id-atom pending-jobs-atom offer-cache
    max-considerable scaleback
    floor-iterations-before-warn floor-iterations-before-reset
    trigger-chan]
@@ -779,7 +778,7 @@
                                                  (cache/miss c slave-id attrs)))))
                       _ (log/debug "Passing following offers to handle-resource-offers!" offers)
                       user->quota (quota/create-user->quota-fn (d/db conn))
-                      matched-head? (handle-resource-offers! conn @driver-atom fenzo @fid-atom pending-jobs-atom offer-cache @user->usage-future user->quota num-considerable offers-chan offers)]
+                      matched-head? (handle-resource-offers! conn @driver-atom fenzo @framework-id-atom pending-jobs-atom offer-cache @user->usage-future user->quota num-considerable offers-chan offers)]
                   (when (seq offers)
                     (reset! resources-atom (view-incubating-offers fenzo)))
                   ;; This check ensures that, although we value Fenzo's optimizations,
@@ -833,7 +832,7 @@
 ;; TODO test that this fenzo recovery system actually works
 (defn reconcile-tasks
   "Finds all non-completed tasks, and has Mesos let us know if any have changed."
-  [db driver fid fenzo]
+  [db driver framework-id fenzo]
   (let [running-tasks (q '[:find ?task-id ?status ?slave-id
                            :in $ [?status ...]
                            :where
@@ -872,7 +871,7 @@
 
 ;; TODO this should be running and enabled
 (defn reconciler
-  [conn driver fid fenzo & {:keys [interval]
+  [conn driver framework-id fenzo & {:keys [interval]
                             :or {interval (* 30 60 1000)}}]
   (log/info "Starting reconciler. Interval millis:" interval)
   (chime-at (periodic/periodic-seq (time/now) (time/millis interval))
@@ -880,7 +879,7 @@
               (timers/time!
                 reconciler-duration
                 (reconcile-jobs conn)
-                (reconcile-tasks (db conn) driver fid fenzo)))))
+                (reconcile-tasks (db conn) driver framework-id fenzo)))))
 
 (defn get-lingering-tasks
   "Return a list of lingering tasks.
@@ -1301,11 +1300,11 @@
 
 (defn create-mesos-scheduler
   "Creates the mesos scheduler which processes status updates asynchronously but in order of receipt."
-  [fid set-framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan match-trigger-chan]
+  [framework-id-atom set-framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan match-trigger-chan]
   (mesos/scheduler
     (registered [this driver framework-id master-info]
                 (log/info "Registered with mesos with framework-id " framework-id)
-                (reset! fid framework-id)
+                (reset! framework-id-atom framework-id)
                 (set-framework-id framework-id)
                 (when (and gpu-enabled? (not (re-matches #"1\.\d+\.\d+" (:version master-info))))
                   (binding [*out* *err*]
@@ -1318,7 +1317,7 @@
                 (future
                   (try
                     (reconcile-jobs conn)
-                    (reconcile-tasks (db conn) driver @fid fenzo)
+                    (reconcile-tasks (db conn) driver @framework-id-atom fenzo)
                     (catch Exception e
                       (log/error e "Reconciliation error")))))
     (reregistered [this driver master-info]
@@ -1326,7 +1325,7 @@
                   (future
                     (try
                       (reconcile-jobs conn)
-                      (reconcile-tasks (db conn) driver @fid fenzo)
+                      (reconcile-tasks (db conn) driver @framework-id-atom fenzo)
                       (catch Exception e
                         (log/error e "Reconciliation error")))))
     ;; Ignore this--we can just wait for new offers
@@ -1355,9 +1354,9 @@
 
   (persist-mea-culpa-failure-limit! conn mea-culpa-failure-limit)
 
-  (let [fid (atom nil)
+  (let [framework-id-atom (atom nil)
         fenzo (make-fenzo-scheduler driver-atom offer-incubate-time-ms fenzo-fitness-calculator good-enough-fitness)
-        [offers-chan resources-atom] (make-offer-handler conn driver-atom fenzo fid pending-jobs-atom offer-cache fenzo-max-jobs-considered fenzo-scaleback fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-reset match-trigger-chan)]
+        [offers-chan resources-atom] (make-offer-handler conn driver-atom fenzo framework-id-atom pending-jobs-atom offer-cache fenzo-max-jobs-considered fenzo-scaleback fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-reset match-trigger-chan)]
     (start-jobs-prioritizer! conn pending-jobs-atom task-constraints rank-trigger-chan)
-    {:scheduler (create-mesos-scheduler fid set-framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan match-trigger-chan)
+    {:scheduler (create-mesos-scheduler framework-id-atom set-framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan match-trigger-chan)
      :view-incubating-offers (fn get-resources-atom [] @resources-atom)}))
