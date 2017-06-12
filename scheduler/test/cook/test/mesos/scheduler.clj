@@ -987,10 +987,10 @@
         conn (restore-fresh-database! uri)
         make-message (fn [message] (-> message json/write-str str (.getBytes "UTF-8")))
         query-instance-field (fn [instance-id field]
-                               (ffirst (q '[:find ?sandbox
+                               (ffirst (q '[:find ?value
                                             :in $ ?i ?field
                                             :where
-                                            [?i ?field ?sandbox]
+                                            [?i ?field ?value]
                                             [?i :instance/task-id ?task-id]]
                                           (db conn) instance-id field)))]
     (testing "missing task-id in message"
@@ -1003,14 +1003,14 @@
         (let [message (make-message {:task-id task-id})]
           (is (nil? (sched/handle-framework-message conn message))))))
 
-    (testing "sandbox-location update"
+    (testing "sandbox-directory update"
       (let [job-id (create-dummy-job conn :user "test-user" :job-state :job.state/running)
             task-id (str (UUID/randomUUID))
             instance-id (create-dummy-instance conn job-id :instance-status :instance.status/running :task-id task-id)]
-        (let [sandbox-location "/sandbox/location/for/task"
-              message (make-message {:task-id task-id :sandbox-location sandbox-location})]
+        (let [sandbox-directory "/sandbox/location/for/task"
+              message (make-message {:task-id task-id :sandbox-directory sandbox-directory})]
           (async/<!! (sched/handle-framework-message conn message))
-          (is (= sandbox-location (query-instance-field instance-id :instance/sandbox))))))
+          (is (= sandbox-directory (query-instance-field instance-id :instance/sandbox-directory))))))
 
     (testing "progress-message update"
       (let [job-id (create-dummy-job conn :user "test-user" :job-state :job.state/running)
@@ -1050,17 +1050,17 @@
         (let [exit-code 0
               progress 90
               progress-message "Almost complete..."
-              sandbox-location "/sandbox/location/for/task"
+              sandbox-directory "/sandbox/location/for/task"
               message (make-message {:task-id task-id
                                      :exit-code exit-code
                                      :progress-message progress-message
                                      :progress-percent progress
-                                     :sandbox-location sandbox-location})]
+                                     :sandbox-directory sandbox-directory})]
           (async/<!! (sched/handle-framework-message conn message))
           (is (= exit-code (query-instance-field instance-id :instance/exit-code)))
           (is (= progress (query-instance-field instance-id :instance/progress)))
           (is (= progress-message (query-instance-field instance-id :instance/progress-message)))
-          (is (= sandbox-location (query-instance-field instance-id :instance/sandbox))))))))
+          (is (= sandbox-directory (query-instance-field instance-id :instance/sandbox-directory))))))))
 
 (deftest test-handle-stragglers
   (let [uri "datomic:mem://test-handle-stragglers"

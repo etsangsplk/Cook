@@ -179,7 +179,7 @@
    (s/optional-key :exit_code) s/Int
    (s/optional-key :progress) s/Int
    (s/optional-key :progress_message) s/Str
-   (s/optional-key :sandbox) s/Str})
+   (s/optional-key :sandbox_directory) s/Str})
 
 (defn max-128-characters-and-alphanum?
   "Returns true if s contains only '.', '_', '-' or
@@ -742,12 +742,16 @@
       (if val @val @run))))
 
 (defn retrieve-url-path
-  "Takes the executor-id->sandbox-directory from the agent json and constructs a URL to query it. Hardcodes fun
-   stuff like the port we run the agent on. Users will need to add the file path & offset to their query. Refer to
-   the 'Using the output_url' section in docs/scheduler-rest-api.asc for further details."
-  [framework-id agent-hostname executor-id sandbox-location]
+  "Constructs a URL to query the sandbox directory of the task.
+   Uses either the provided sandbox-directory or takes the executor-id->sandbox-directory from the agent json to
+   determine the sandbox directory.
+   sandbox-directory will be populated in the instance by the cook executor, else it may be nil when the query to
+   the agent needs to me made.
+   Hardcodes fun stuff like the port we run the agent on. Users will need to add the file path & offset to their query.
+   Refer to the 'Using the output_url' section in docs/scheduler-rest-api.asc for further details."
+  [framework-id agent-hostname executor-id sandbox-directory]
   (try
-    (when-let [directory (or sandbox-location
+    (when-let [directory (or sandbox-directory
                              ((get-executor-id->sandbox-directory framework-id agent-hostname) executor-id))]
       (str "http://" agent-hostname ":5051" "/files/read.json?path="
            (URLEncoder/encode directory "UTF-8")))
@@ -760,8 +764,8 @@
   [db framework-id instance]
   (let [hostname (:instance/hostname instance)
         executor-id (:instance/executor-id instance)
-        sandbox (:instance/sandbox instance)
-        url-path (retrieve-url-path framework-id hostname executor-id sandbox)
+        sandbox-directory (:instance/sandbox-directory instance)
+        url-path (retrieve-url-path framework-id hostname executor-id sandbox-directory)
         start (:instance/start-time instance)
         mesos-start (:instance/mesos-start-time instance)
         end (:instance/end-time instance)
@@ -788,7 +792,7 @@
                           :reason_string (:reason/string reason))
             progress (assoc :progress progress)
             progress-message (assoc :progress_message progress-message)
-            sandbox (assoc :sandbox sandbox))))
+            sandbox-directory (assoc :sandbox_directory sandbox-directory))))
 
 (defn fetch-job-map
   [db fid job-uuid]
